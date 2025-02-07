@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+
+
+################################################################################
+#                                                                              #
+# Clear parameters to use, and parse commandline arguments                     #
+#                                                                              #
+################################################################################
+
+help=0
+list=0
+kubeconfig=''
+context=''
+
+parse_args=1
+active_arg=''
+
+for arg in "$@"; do
+  ((   parse_args )) && [[ "${arg}" == '--' ]] && parse_args=0 && continue
+  (( ! parse_args )) && [[ "${arg}" == '++' ]] && parse_args=1 && continue
+  if (( parse_args )) && [[ "${arg:0:2}" == '--' ]]; then
+    case "${arg:2}" in
+      'help')           help=1;;
+      'list')           list=1;;
+      'kubeconfig')     active_arg='kubeconfig';;
+      *) echo "Unrecognized commandline parameter '${arg}'." >&2;
+         exit 1;;
+    esac
+    continue
+  fi
+  if (( parse_args )) && [[ "${arg:0:1}" == '-' ]]; then
+    for (( i=1; i<${#arg}; i++ )); do
+      case "${arg:i:1}" in
+        'h'|'?') help=1;;
+        'l')     list=1;;
+        'K')     active_arg='kubeconfig';;
+        *) echo "Unrecognized commandline parameter '-${arg:i:1}'." >&2;
+           exit 1;;
+      esac
+    done
+    continue
+  fi
+  case "${active_arg}" in
+    'kubeconfig') kubeconfig="${arg}" && active_arg='';;
+    *)            context="${arg}";;
+  esac
+done
+
+if (( help )); then
+cat << EOF >&2
+ktx [OPTIONS] [CONTEXT]
+
+OPTIONS:
+  -h, -?, --help                Show this help message.
+  -l, --list                    List matching contexts.
+  -K, --kubeconfig KUBECONFIG   Path to kubeconfig file.
+  
+  CONTEXT                       Context (or context-pattern) to list or set.
+EOF
+exit
+fi
+
+
+################################################################################
+#                                                                              #
+# Sanitize and validate arguments, and set up environment                      #
+#                                                                              #
+################################################################################
+
+confpaths() {
+  local n="$1" e xdg="${XDG_CONFIG_HOME:-${HOME}/.config}"
+  if [ -d "${xdg}" ]; then
+    [ -d "${xdg}/${n}" ] && echo "${xdg}/${n}/"
+    for e in conf cfg xml yaml yml json; do
+      [ -f "${xdg}/${n}.${e}" ] && echo "${xdg}/${n}.${e}"
+      [ -d "${xdg}/${n}.${e}.d" ] && echo "${xdg}/${n}.${e}.d/"
+    done
+    [ -d "${xdg}/${n}.d" ] && echo "${xdg}/${n}.d/"
+  fi
+  [ -d "${HOME}/.${n}" ] && echo "${HOME}/.${n}/"
+  for e in conf cfg xml yaml yml json; do
+    [ -f "${HOME}/.${n}.${e}" ] && echo "${HOME}/.${n}.${e}"
+    [ -d "${HOME}/.${n}.${e}.d" ] && echo "${HOME}/.${n}.${e}.d/"
+  done
+  [ -d "${HOME}/.${n}.d" ] && echo "${HOME}/.${n}.d/"
+}
+
+set_kubeconfig() {
+  local p c
+  [[ -n "${kubeconfig:=${KUBECONFIG}}" ]] && return 0
+  while read p; do
+    c="$(realpath -s "${p}")/config"
+    [[ -f "${c}" ]] && kubeconfig="${c}" && return 0
+  done < <(confpaths kube)
+  [[ -n "${kubeconfig}" ]]
+}
+
+if ! set_kubeconfig; then
+  echo "Could not determine kubeconfig file." >&2
+  exit 1
+fi
+if ! [[ -f "${kubeconfig}" ]]; then
+  echo "Kubeconfig path '${kubeconfig}' appears not to be a file." >&2
+  exit 1
+fi
+
+
+################################################################################
+#                                                                              #
+# declare functions                                                            #
+#                                                                              #
+################################################################################
+
+k() {
+  kubectl --kubeconfig "${kubeconfig}" "$@"
+}
+
+kc() {
+  k config "$@"
+}
+
+kg() {
+  k get "$@"
+}
+
+get_contexts() {
+  local contexts="$(kc view | yq 'pick(["current-context", "contexts"])
+                                  | .contexts |= map(.name)')"
+  if (( $# )); then
+    yq '.contexts |= map(select(test("'"${1}"'")))' <<< "${contexts}"
+  else
+    yq '.' <<< "${contexts}"
+  fi
+}
+
+ectx() {
+  echo -e "\e[37;2m-\e[0m \e[32;1m${1}\e[0m"
+}
+ecctx() {
+  echo -e "\e[37;1m*\e[0m \e[31;1m${1}\e[0m"
+}
+
+
+################################################################################
+#                                                                              #
+# Do the thing!                                                                #
+#                                                                              #
+################################################################################
+
+if (( ! $# )); then
+  kc view | yq 'pick(["current-context"])'
+  exit 0
+fi
+
+contexts="$(get_contexts "${context}")"
+if (( list )); then
+  cctx="$(yq '.current-context' <<< "${contexts}")"
+  while read ctx; do
+    [[ "${ctx}" == "${cctx}" ]] && ecctx "${ctx}" || ectx "${ctx}"
+  done < <(yq '.contexts[]' <<< "${contexts}" | sort -u)
+else
+  n="$(yq '.contexts | length' <<< "${contexts}")"
+  case "${n}" in
+    1) kc use-context "$(yq '.contexts[0]' <<< "${contexts}")";
+       kc view | yq 'pick(["current-context"])';;
+    0) echo "No contexts found matching '${context}'." >&2;
+       exit 1;;
+    *) echo "Multiple (${n}) contexts found matching '${context}'." >&2;
+       exit 1;;
+  esac
+fi
