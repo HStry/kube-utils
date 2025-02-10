@@ -1,2 +1,2 @@
-# kube-utils
-Some kubernetes utilities
+# cli-utils
+Some cli (mostly bash) utilities
